@@ -42,8 +42,21 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className={`${geist.variable}`}>
-      <body>
-        <TRPCReactProvider>{children}</TRPCReactProvider>
+      <body className="flex min-h-screen flex-col">
+        <TRPCReactProvider>
+          <main className="flex-1">{children}</main>
+          <footer className="mt-auto py-4 text-center text-sm text-gray-600">
+            Made by{" "}
+            <a
+              href="https://jetpham.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-600 hover:underline"
+            >
+              Jet
+            </a>
+          </footer>
+        </TRPCReactProvider>
       </body>
     </html>
   );
