@@ -3,8 +3,6 @@ import "~/styles/globals.css";
 import { type Metadata } from "next";
 import { Geist } from "next/font/google";
 
-import { TRPCReactProvider } from "~/trpc/react";
-
 export const metadata: Metadata = {
   title: "FBI Most Wanted",
   description: "Browse FBI Wanted Persons Browser",
@@ -43,20 +41,18 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${geist.variable}`}>
       <body className="flex min-h-screen flex-col">
-        <TRPCReactProvider>
-          <main className="flex-1">{children}</main>
-          <footer className="mt-auto py-4 text-center text-sm text-gray-600">
-            Made by{" "}
-            <a
-              href="https://jetpham.com"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-600 hover:underline"
-            >
-              Jet
-            </a>
-          </footer>
-        </TRPCReactProvider>
+        <main className="flex-1">{children}</main>
+        <footer className="mt-auto py-4 text-center text-sm text-gray-600">
+          Made by{" "}
+          <a
+            href="https://jetpham.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-600 hover:underline"
+          >
+            Jet
+          </a>
+        </footer>
       </body>
     </html>
   );
