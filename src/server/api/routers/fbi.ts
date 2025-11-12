@@ -4,6 +4,100 @@ import { createTRPCRouter, publicProcedure } from "~/server/api/trpc";
 
 const FBI_API_BASE_URL = "https://api.fbi.gov";
 
+// Exponential backoff configuration for 429 errors
+const MAX_RETRIES = 5;
+const INITIAL_DELAY_MS = 1000; // Start with 1 second
+
+/**
+ * Fetches a URL with exponential backoff retry for 429 errors
+ * Returns null if all retries are exhausted
+ */
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxRetries: number = MAX_RETRIES,
+): Promise<WantedResultSet | null> {
+  let attempt = 0;
+  
+  while (attempt <= maxRetries) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      
+      // If we get a 429, retry with exponential backoff
+      if (response.status === 429) {
+        // Consume the response body to avoid memory leaks
+        await response.text().catch(() => {});
+        
+        if (attempt < maxRetries) {
+          const delayMs = INITIAL_DELAY_MS * Math.pow(2, attempt);
+          console.warn(
+            `FBI API rate limited (429) for ${url}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          attempt++;
+          continue;
+        } else {
+          // Max retries exhausted, give up on this page
+          console.error(
+            `FBI API rate limited (429) for ${url}, max retries exhausted. Skipping this page.`,
+          );
+          return null;
+        }
+      }
+      
+      // For other non-OK responses, throw error (don't retry)
+      if (!response.ok) {
+        // Consume the response body before throwing
+        await response.text().catch(() => {});
+        throw new Error(`FBI API error: ${response.status} ${response.statusText}`);
+      }
+      
+      // Success - parse and return
+      return (await response.json()) as WantedResultSet;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      controller.abort();
+      
+      // Handle timeout errors
+      if (error instanceof Error && error.name === "AbortError") {
+        // Don't retry timeouts, throw immediately
+        throw new Error(`FBI API request timed out`);
+      }
+      
+      // For non-429 errors, throw immediately (don't retry)
+      if (error instanceof Error && !error.message.includes("429")) {
+        throw error;
+      }
+      
+      // This shouldn't happen since we handle 429 above, but just in case
+      if (attempt < maxRetries) {
+        const delayMs = INITIAL_DELAY_MS * Math.pow(2, attempt);
+        console.warn(
+          `FBI API error for ${url}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        attempt++;
+        continue;
+      }
+      
+      // Max retries exhausted
+      console.error(
+        `FBI API error for ${url}, max retries exhausted. Skipping this page.`,
+      );
+      return null;
+    }
+  }
+  
+  return null;
+}
+
 // Types based on FBI API OpenAPI spec
 export interface WantedImage {
   caption: string | null;
@@ -101,36 +195,16 @@ export const fbiRouter = createTRPCRouter({
       });
       const firstPageUrl = `${FBI_API_BASE_URL}/@wanted?${firstPageParams.toString()}`;
       
-      const firstPageController = new AbortController();
-      const firstPageTimeoutId = setTimeout(() => firstPageController.abort(), 30000);
+      const firstPageData = await fetchWithRetry(firstPageUrl, {
+        method: "GET",
+        headers: { "Accept": "application/json" },
+      });
 
-      let firstPageResponse: Response;
-      try {
-        firstPageResponse = await fetch(firstPageUrl, {
-          method: "GET",
-          headers: { "Accept": "application/json" },
-          signal: firstPageController.signal,
-        });
-        clearTimeout(firstPageTimeoutId);
-      } catch (error) {
-        clearTimeout(firstPageTimeoutId);
-        if (error instanceof Error && error.name === "AbortError") {
-          throw new Error("FBI API request timed out");
-        }
-        throw error;
-      }
-
-      if (!firstPageResponse.ok) {
+      // If first page fails completely, we can't proceed
+      if (!firstPageData) {
         throw new Error(
-          `FBI API error: ${firstPageResponse.status} ${firstPageResponse.statusText}`,
+          "FBI API error: Failed to fetch first page after retries (429 Too Many Requests)",
         );
-      }
-
-      let firstPageData: WantedResultSet;
-      try {
-        firstPageData = (await firstPageResponse.json()) as WantedResultSet;
-      } catch {
-        throw new Error("Failed to parse FBI API response");
       }
 
       // Calculate total pages needed
@@ -140,43 +214,49 @@ export const fbiRouter = createTRPCRouter({
       // Process pages in batches of 5 to be respectful to the API
       const BATCH_SIZE = 5;
       const remainingPages: WantedResultSet[] = [];
+      const failedPages: number[] = [];
 
       for (let batchStart = 1; batchStart < totalPages; batchStart += BATCH_SIZE) {
         const batchEnd = Math.min(batchStart + BATCH_SIZE, totalPages);
-        const batch = await Promise.all(
-          Array.from({ length: batchEnd - batchStart }, (_, i) => {
-            const pageNum = batchStart + i + 1;
-            const pageParams = new URLSearchParams({
-              ...baseParams,
-              page: String(pageNum),
-            });
-            const url = `${FBI_API_BASE_URL}/@wanted?${pageParams.toString()}`;
-            
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 30000);
+        const batchPromises = Array.from({ length: batchEnd - batchStart }, (_, i) => {
+          const pageNum = batchStart + i + 1;
+          const pageParams = new URLSearchParams({
+            ...baseParams,
+            page: String(pageNum),
+          });
+          const url = `${FBI_API_BASE_URL}/@wanted?${pageParams.toString()}`;
+          
+          return fetchWithRetry(url, {
+            method: "GET",
+            headers: { "Accept": "application/json" },
+          }).then((result) => ({
+            pageNum,
+            result,
+          }));
+        });
 
-            return fetch(url, {
-              method: "GET",
-              headers: { "Accept": "application/json" },
-              signal: controller.signal,
-            })
-              .then((res) => {
-                clearTimeout(timeoutId);
-                if (!res.ok) {
-                  throw new Error(`FBI API error: ${res.status} ${res.statusText}`);
-                }
-                return res.json() as Promise<WantedResultSet>;
-              })
-              .catch((error) => {
-                clearTimeout(timeoutId);
-                if (error instanceof Error && error.name === "AbortError") {
-                  throw new Error(`FBI API request timed out for page ${pageNum}`);
-                }
-                throw error;
-              });
-          }),
+        // Use allSettled to handle failures gracefully
+        const batchResults = await Promise.allSettled(batchPromises);
+        
+        for (const result of batchResults) {
+          if (result.status === "fulfilled") {
+            if (result.value.result) {
+              remainingPages.push(result.value.result);
+            } else {
+              failedPages.push(result.value.pageNum);
+            }
+          } else {
+            // Log the error but continue processing other pages
+            console.error(`Failed to fetch page: ${result.reason}`);
+          }
+        }
+      }
+
+      // Log summary of failed pages if any
+      if (failedPages.length > 0) {
+        console.warn(
+          `Failed to fetch ${failedPages.length} page(s) after retries: ${failedPages.join(", ")}. Continuing with available data.`,
         );
-        remainingPages.push(...batch);
       }
 
       // Combine all items from all pages
@@ -188,8 +268,9 @@ export const fbiRouter = createTRPCRouter({
       // Verify we got all pages (sanity check)
       if (allItems.length < (firstPageData.total ?? 0)) {
         // Log warning if we didn't get all items (but continue with what we have)
+        const missingCount = (firstPageData.total ?? 0) - allItems.length;
         console.warn(
-          `Warning: Expected ${firstPageData.total} items but only received ${allItems.length}`,
+          `Warning: Expected ${firstPageData.total} items but only received ${allItems.length} (missing ${missingCount} items${failedPages.length > 0 ? ` from ${failedPages.length} failed page(s)` : ""})`,
         );
       }
 
