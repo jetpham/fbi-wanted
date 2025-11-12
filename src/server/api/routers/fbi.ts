@@ -1,3 +1,4 @@
+import { cacheLife } from "next/cache";
 import { z } from "zod";
 
 import { createTRPCRouter, publicProcedure } from "~/server/api/trpc";
@@ -33,7 +34,7 @@ async function fetchWithRetry(
       // If we get a 429, retry with exponential backoff
       if (response.status === 429) {
         // Consume the response body to avoid memory leaks
-        await response.text().catch(() => {});
+        await response.text().catch(() => void 0);
         
         if (attempt < maxRetries) {
           const delayMs = INITIAL_DELAY_MS * Math.pow(2, attempt);
@@ -55,7 +56,7 @@ async function fetchWithRetry(
       // For other non-OK responses, throw error (don't retry)
       if (!response.ok) {
         // Consume the response body before throwing
-        await response.text().catch(() => {});
+        await response.text().catch(() => void 0);
         throw new Error(`FBI API error: ${response.status} ${response.statusText}`);
       }
       
@@ -180,6 +181,9 @@ export const fbiRouter = createTRPCRouter({
         .optional(),
     )
     .query(async ({ input }) => {
+      "use cache";
+      cacheLife("weeks"); // Cache for 1 week - FBI data updates weekly
+
       const pageSize = 50;
       const baseParams: Record<string, string> = {
         pageSize: String(pageSize),
